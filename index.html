@@ -73,7 +73,6 @@
       attribution: '© OpenStreetMap contributors | Data: Brisbane City Council'
     }).addTo(map);
     L.DomEvent.disableClickPropagation(document.getElementById('panel'));
-
     // 구역(면) 레이어는 선·점보다 아래에 그리려고 별도 층을 만들어요
     map.createPane('permitPane').style.zIndex = 350;
 
@@ -115,11 +114,14 @@
       },
       onEachFeature: (feature, layer) => {
         const p = feature.properties || {};
-        layer.bindPopup(
-          `<b>${p.STREET || '(도로명 없음)'}</b><br>` +
-          `종류: ${(p.PARKINGRESTRICTIONTYPE || '-').trim()}<br>` +
-          `<span style="font-size:12px;color:#555">시간 제한과 유료 여부는 현장 표지판을 확인하세요</span>`
-        );
+       
+layer.bindPopup(
+  `<b>${p.STREET || '(도로명 없음)'}</b><br>` +
+  `종류: ${(p.PARKINGRESTRICTIONTYPE || '-').trim()}<br>` +
+  `<span style="font-size:12px;color:#555">시간 제한과 유료 여부는 현장 표지판을 확인하세요</span><br><br>` +
+  `<a href="https://www.google.com/maps/dir/?api=1&destination=${layer.getBounds().getCenter().lat},${layer.getBounds().getCenter().lng}" target="_blank" rel="noopener noreferrer">📍 Google Maps에서 길 찾기 ↗</a>`
+);
+
       }
     }).addTo(map);
 
@@ -184,10 +186,11 @@
           .filter(([k, v]) => !skip.test(k) && v !== null && v !== '')
           .map(([k, v]) => `${esc(k)}: ${esc(v)}`)
           .join('<br>');
-        layer.bindPopup(
-          `<b>거주자 허가·구역 규정 구역</b><br>${rows || '(상세 정보 없음)'}<br>` +
-          `<span style="font-size:12px;color:#555">구역 안 개별 표지판이 우선해요. 현장 표지판을 확인하세요</span>`
-        );
+          layer.bindPopup(
+  `<b>거주자 허가·구역 규정 구역</b><br>${rows || '(상세 정보 없음)'}<br>` +
+  `<span style="font-size:12px;color:#555">구역 안 개별 표지판이 우선해요. 현장 표지판을 확인하세요</span><br><br>` +
+  `<a href="https://www.google.com/maps/dir/?api=1&destination=${layer.getBounds().getCenter().lat},${layer.getBounds().getCenter().lng}" target="_blank" rel="noopener noreferrer">📍 Google Maps에서 길 찾기 ↗</a>`
+);
       }
     }).addTo(map);
 
@@ -259,16 +262,25 @@
         const p = f.properties;
         const ratio = (c === null || max === min) ? 0 : (c - min) / (max - min);
         const color = c === null ? '#9ca3af' : `hsl(${120 * (1 - ratio)},70%,42%)`;
-        const marker = L.circleMarker([lat, lng], { radius: 6, color, fillColor: color, fillOpacity: 0.8 })
-          .bindPopup(
-            `<b>${get(p, 'STREET')}</b> (${get(p, 'SUBURB')})<br>` +
-            `${hrs}시간 예상 요금: ${c === null ? '이 시간 동안 주차 불가' : '$' + c.toFixed(2)}<br>` +
-            `시간당 요금: ${get(p, 'TAR_RATE_WEEKDAY')}<br>` +
-            `최대 요금(4시간 이상): ${get(p, 'MAX_CAP_CHG')}<br>` +
-            `최대 주차 시간: ${get(p, 'MAX_STAY_HRS')}<br>` +
-            `제한 조건: ${get(p, 'RESTRICTIONS')}<br>` +
-            `미터기 번호: ${get(p, 'METER_NO')}`
-          );
+       
+        const marker = L.circleMarker([lat, lng], {
+          radius: 6,
+          color,
+          fillColor: color,
+          fillOpacity: 0.8
+        }).bindPopup(
+          `<b>${get(p, 'STREET')}</b> (${get(p, 'SUBURB')})<br>` +
+          `${hrs}시간 예상 요금: ${c === null ? '이 시간 동안 주차 불가' : '$' + c.toFixed(2)}<br>` +
+          `시간당 요금: ${get(p, 'TAR_RATE_WEEKDAY')}<br>` +
+          `최대 요금(4시간 이상): ${get(p, 'MAX_CAP_CHG')}<br>` +
+          `최대 주차 시간: ${get(p, 'MAX_STAY_HRS')}<br>` +
+          `제한 조건: ${get(p, 'RESTRICTIONS')}<br>` +
+          `미터기 번호: ${get(p, 'METER_NO')}<br><br>` +
+          `<a href="https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}" ` +
+          `target="_blank" rel="noopener noreferrer">` +
+          `📍 Google Maps에서 길 찾기 ↗</a>`
+        );
+
         if (showStay) {
           marker.bindTooltip(esc(get(p, 'MAX_STAY_HRS')), {
             permanent: true, direction: 'right', offset: [6, 0], className: 'stay-label'
