@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>브리즈번 주차 지도</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    html, body { height: 100%; margin: 0; }
+    #map { height: 100%; }
+    #panel {
+      position: absolute; top: 10px; right: 10px; z-index: 1000;
+      background: white; padding: 10px 12px; border-radius: 8px;
+      box-shadow: 0 1px 6px rgba(0,0,0,.3); font: 14px sans-serif;
+      max-width: 250px; max-height: 90vh; overflow: auto;
+    }
+    #panel input[type=number] { width: 60px; }
+    .row { margin-top: 8px; }
+    .small { font-size: 12px; color: #555; }
+    .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 4px; }
+    .bar { display: inline-block; width: 18px; height: 4px; background: #16a34a; margin-right: 4px; vertical-align: middle; }
+    .box { display: inline-block; width: 12px; height: 12px; border: 2px dashed #7c3aed; background: rgba(124,58,237,.12); margin-right: 4px; vertical-align: middle; }
+    .stay-label { padding: 0 4px; font-size: 11px; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="panel">
+    <label>주차 시간 <input id="hours" type="number" min="0.5" max="12" step="0.5" value="2"> 시간</label>
+    <div id="summary" class="row"></div>
+    <div class="row">
+      <label class="small"><input id="hideBlocked" type="checkbox"> 이 시간 주차 불가 미터기 숨기기</label><br>
+      <label class="small"><input id="showStay" type="checkbox"> 미터기 시간 제한 라벨 (많이 확대하면 표시)</label>
+    </div>
+
+    <div class="row">
+      <label><input id="showLines" type="checkbox" checked> 스트릿 주차 가능 구간 보기</label>
+      <div id="lineStatus" class="small"></div>
+      <label class="small"><input id="showAccessible" type="checkbox"> 장애인 주차 (파랑)</label><br>
+      <label class="small"><input id="showMoto" type="checkbox"> 오토바이 주차 (주황)</label>
+    </div>
+
+    <div class="row">
+      <label><input id="showPermit" type="checkbox" checked> 거주자 허가·구역 규정 구역 보기</label>
+      <div id="permitStatus" class="small"></div>
+    </div>
+
+    <div class="row small">
+      <span class="bar"></span>주차 칸이 표시된 구간<br>
+      <span class="box"></span>거주자 허가·구역 규정 구역<br>
+      <span class="dot" style="background:hsl(120,70%,42%)"></span>저렴한 미터기
+      <span class="dot" style="background:hsl(0,70%,42%)"></span>비싼 미터기
+      <span class="dot" style="background:#9ca3af"></span>주차 불가
+    </div>
+    <div class="row small">
+      참고용이에요. 요금은 평일 낮(7am~7pm) 기준이고, 실제 주차 가능 여부와 시간 제한은 현장 표지판이 우선이에요.
+    </div>
+  </div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script>
+    const map = L.map('map').setView([-27.4698, 153.0251], 17);
+    L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+      maxZoom: 19,
+      attribution: '© OpenStreetMap contributors | Data: Brisbane City Council'
+    }).addTo(map);
+    L.DomEvent.disableClickPropagation(document.getElementById('panel'));
+
+    // 구역(면) 레이어는 선·점보다 아래에 그리려고 별도 층을 만들어요
+    map.createPane('permitPane').style.zIndex = 350;
+
+    // ===== 공통 도우미 =====
+    const get = (p, k) => p[k.toLowerCase()] ?? p[k.toUpperCase()] ?? '-';
+    const esc = s => String(s).replace(/[&<>"']/g, c =>
+      ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+    const num = v => {
+      const n = parseFloat(String(v).replace(/[^0-9.]/g, ''));
+      return isNaN(n) ? null : n;
+    };
+    const parseStay = v => {
+      const s = String(v);
+      if (s.includes('1/4')) return 0.25;
+      if (s.includes('1/2')) return 0.5;
+      const m = s.match(/\d+(\.\d+)?/);
+      return m ? parseFloat(m[0]) : null;
+    };
+    function cost(p, hrs) {
+      const rate = num(get(p, 'TAR_RATE_WEEKDAY'));
+      const cap = num(get(p, 'MAX_CAP_CHG'));
+      const stay = parseStay(get(p, 'MAX_STAY_HRS'));
+      if (rate === null) return null;
+      if (stay !== null && hrs > stay) return null;
+      let c = rate * hrs;
+      if (cap !== null && hrs >= 4) c = Math.min(c, cap);
+      return c;
+    }
+
+    // ===== 1) 스트릿 주차 가능 구간 (화면 범위만 요청) =====
+    const LINES_URL = 'https://services2.arcgis.com/dEKgZETqwmDAh1rP/ArcGIS/rest/services/Parking_Line_locations/FeatureServer/0/query';
+    const linesLayer = L.geoJSON(null, {
+      style: feature => {
+        const t = ((feature.properties || {}).PARKINGRESTRICTIONTYPE || '').trim();
+        const color = t === 'Accessible Parking' ? '#2563eb'
+                    : t === 'Motorcycle Parking' ? '#ea580c'
+                    : '#16a34a';
+        return { color, weight: 5, opacity: 0.85 };
+      },
+      onEachFeature: (feature, layer) => {
+        const p = feature.properties || {};
+        layer.bindPopup(
+          `<b>${p.STREET || '(도로명 없음)'}</b><br>` +
+          `종류: ${(p.PARKINGRESTRICTIONTYPE || '-').trim()}<br>` +
+          `<span style="font-size:12px;color:#555">시간 제한과 유료 여부는 현장 표지판을 확인하세요</span>`
+        );
+      }
+    }).addTo(map);
+
+    function buildWhere() {
+      const parts = ["PARKINGRESTRICTIONTYPE LIKE 'Parking%'"];
+      if (document.getElementById('showAccessible').checked) parts.push("PARKINGRESTRICTIONTYPE LIKE 'Accessible%'");
+      if (document.getElementById('showMoto').checked) parts.push("PARKINGRESTRICTIONTYPE LIKE 'Motorcycle%'");
+      return parts.join(' OR ');
+    }
+
+    let lineReq = 0;
+    async function loadLines() {
+      const status = document.getElementById('lineStatus');
+      if (!document.getElementById('showLines').checked) {
+        linesLayer.clearLayers(); status.textContent = ''; return;
+      }
+      if (map.getZoom() < 16) {
+        linesLayer.clearLayers();
+        status.textContent = '지도를 더 확대하면 주차 가능 구간이 보여요';
+        return;
+      }
+      const b = map.getBounds();
+      const params = new URLSearchParams({
+        where: buildWhere(),
+        geometry: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(','),
+        geometryType: 'esriGeometryEnvelope',
+        inSR: '4326',
+        spatialRel: 'esriSpatialRelIntersects',
+        outFields: 'STREET,PARKINGRESTRICTIONTYPE,PAVEMENTMARKINGSUBTYPE',
+        outSR: '4326',
+        f: 'geojson'
+      });
+      const myReq = ++lineReq;
+      status.textContent = '불러오는 중...';
+      try {
+        const res = await fetch(LINES_URL + '?' + params);
+        const data = await res.json();
+        if (myReq !== lineReq) return;
+        if (data.error) throw new Error(data.error.message || 'API 오류');
+        linesLayer.clearLayers();
+        linesLayer.addData(data);
+        linesLayer.bringToBack();
+        const n = (data.features || []).length;
+        status.textContent = n >= 2000
+          ? '구간이 많아 일부만 보여요. 더 확대해 주세요'
+          : `${n}개 구간 표시 중`;
+      } catch (err) {
+        console.error('주차 구간을 불러오지 못했어요:', err);
+        status.textContent = '불러오지 못했어요 (F12 → Console 확인)';
+      }
+    }
+
+    // ===== 2) 거주자 허가·구역 규정 구역 (화면 범위만 요청) =====
+    const PERMIT_URL = 'https://services2.arcgis.com/dEKgZETqwmDAh1rP/ArcGIS/rest/services/Parking_Regulated_Permit_Parking_areas/FeatureServer/0/query';
+    const permitLayer = L.geoJSON(null, {
+      pane: 'permitPane',
+      style: { color: '#7c3aed', weight: 2, dashArray: '6 4', fillColor: '#7c3aed', fillOpacity: 0.10 },
+      onEachFeature: (feature, layer) => {
+        const p = feature.properties || {};
+        const skip = /objectid|globalid|shape|created|edited|^id$/i;
+        const rows = Object.entries(p)
+          .filter(([k, v]) => !skip.test(k) && v !== null && v !== '')
+          .map(([k, v]) => `${esc(k)}: ${esc(v)}`)
+          .join('<br>');
+        layer.bindPopup(
+          `<b>거주자 허가·구역 규정 구역</b><br>${rows || '(상세 정보 없음)'}<br>` +
+          `<span style="font-size:12px;color:#555">구역 안 개별 표지판이 우선해요. 현장 표지판을 확인하세요</span>`
+        );
+      }
+    }).addTo(map);
+
+    let permitReq = 0;
+    async function loadPermit() {
+      const status = document.getElementById('permitStatus');
+      if (!document.getElementById('showPermit').checked) {
+        permitLayer.clearLayers(); status.textContent = ''; return;
+      }
+      if (map.getZoom() < 14) {
+        permitLayer.clearLayers();
+        status.textContent = '지도를 더 확대하면 구역이 보여요';
+        return;
+      }
+      const b = map.getBounds();
+      const params = new URLSearchParams({
+        where: '1=1',
+        geometry: [b.getWest(), b.getSouth(), b.getEast(), b.getNorth()].join(','),
+        geometryType: 'esriGeometryEnvelope',
+        inSR: '4326',
+        spatialRel: 'esriSpatialRelIntersects',
+        outFields: '*',
+        outSR: '4326',
+        f: 'geojson'
+      });
+      const myReq = ++permitReq;
+      status.textContent = '불러오는 중...';
+      try {
+        const res = await fetch(PERMIT_URL + '?' + params);
+        const data = await res.json();
+        if (myReq !== permitReq) return;
+        if (data.error) throw new Error(data.error.message || 'API 오류');
+        permitLayer.clearLayers();
+        permitLayer.addData(data);
+        const n = (data.features || []).length;
+        status.textContent = n ? `${n}개 구역 표시 중` : '이 화면에는 해당 구역이 없어요';
+      } catch (err) {
+        console.error('구역 데이터를 불러오지 못했어요:', err);
+        status.textContent = '불러오지 못했어요 (F12 → Console 확인)';
+      }
+    }
+
+    function loadAll() { loadLines(); loadPermit(); }
+    map.on('moveend', loadAll);
+    ['showLines', 'showAccessible', 'showMoto'].forEach(id =>
+      document.getElementById(id).addEventListener('change', loadLines));
+    document.getElementById('showPermit').addEventListener('change', loadPermit);
+
+    // ===== 3) 미터기 + 가격 비교 + 시간 제한 라벨 =====
+    const meterLayer = L.layerGroup().addTo(map);
+    let geo = null;
+
+    function renderMeters() {
+      if (!geo) return;
+      const hrs = parseFloat(document.getElementById('hours').value) || 1;
+      const hideBlocked = document.getElementById('hideBlocked').checked;
+      const showStay = document.getElementById('showStay').checked && map.getZoom() >= 18;
+      meterLayer.clearLayers();
+
+      const items = geo.features
+        .filter(f => f.geometry && f.geometry.coordinates)
+        .map(f => ({ f, c: cost(f.properties, hrs) }));
+      const costs = items.map(i => i.c).filter(c => c !== null);
+      const min = Math.min(...costs), max = Math.max(...costs);
+
+      items.forEach(({ f, c }) => {
+        if (hideBlocked && c === null) return;
+        const [lng, lat] = f.geometry.coordinates;
+        const p = f.properties;
+        const ratio = (c === null || max === min) ? 0 : (c - min) / (max - min);
+        const color = c === null ? '#9ca3af' : `hsl(${120 * (1 - ratio)},70%,42%)`;
+        const marker = L.circleMarker([lat, lng], { radius: 6, color, fillColor: color, fillOpacity: 0.8 })
+          .bindPopup(
+            `<b>${get(p, 'STREET')}</b> (${get(p, 'SUBURB')})<br>` +
+            `${hrs}시간 예상 요금: ${c === null ? '이 시간 동안 주차 불가' : '$' + c.toFixed(2)}<br>` +
+            `시간당 요금: ${get(p, 'TAR_RATE_WEEKDAY')}<br>` +
+            `최대 요금(4시간 이상): ${get(p, 'MAX_CAP_CHG')}<br>` +
+            `최대 주차 시간: ${get(p, 'MAX_STAY_HRS')}<br>` +
+            `제한 조건: ${get(p, 'RESTRICTIONS')}<br>` +
+            `미터기 번호: ${get(p, 'METER_NO')}`
+          );
+        if (showStay) {
+          marker.bindTooltip(esc(get(p, 'MAX_STAY_HRS')), {
+            permanent: true, direction: 'right', offset: [6, 0], className: 'stay-label'
+          });
+        }
+        marker.addTo(meterLayer);
+      });
+
+      document.getElementById('summary').textContent = costs.length
+        ? `미터기 ${costs.length}곳 이용 가능 ($${min.toFixed(2)} ~ $${max.toFixed(2)})`
+        : '이 시간 동안 주차할 수 있는 미터기가 없어요';
+    }
+    document.getElementById('hours').addEventListener('input', renderMeters);
+    document.getElementById('hideBlocked').addEventListener('change', renderMeters);
+    document.getElementById('showStay').addEventListener('change', renderMeters);
+    map.on('zoomend', renderMeters);
+
+    fetch('meters.geojson')
+      .then(res => res.json())
+      .then(data => { geo = data; renderMeters(); })
+      .catch(err => console.error('미터기 데이터를 불러오지 못했어요:', err));
+
+    loadAll();
+  </script>
+</body>
+</html>
